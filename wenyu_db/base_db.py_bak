@@ -1,0 +1,304 @@
+# -*- coding:utf-8 -*-
+
+# Name: base_db
+# Product_name: PyCharm
+# Description:
+# Author : 'zhangjiawen'
+# Date : 2021/6/11 12:42
+
+import re
+from functools import wraps
+
+from jy_utils import str2dict, left_union
+
+
+def parse_db_url(url: str) -> dict:
+    """
+    解析mysql 链接
+    :param url: eg:'test:123456@127.0.0.1:3306/mysql?charset=utf8&autocommit=true'
+    :return:
+    """
+    result = dict()
+    idx1 = url.find('@')
+    user_info = url[:idx1] if idx1 > 1 else ''
+    if user_info:
+        result.update(str2dict(user_info, [':', ], keys=['user', 'passwd']))
+    idx2 = url.find('/', idx1 + 1)
+    host_info = url[idx1+1:idx2] if idx2 > idx1 + 1 else url[idx1+1:]
+    if host_info:
+        result.update(str2dict(host_info, [':', ], keys=['host', 'port']))
+    if idx2 > 0:
+        idx3 = url.find('?', idx2 + 1)
+        result['database'] = url[idx2 + 1:idx3] if idx3 > idx2 + 1 else url[idx2+1:]
+        if not result['database']:
+            result.pop('database')
+        if idx3 > 0:
+            result.update(str2dict(url[idx3+1:], ['&', '=']))
+    return result
+
+
+def gen_sql_with_params(sql: str, params: tuple = None, key_pre='#', **kw):
+    """
+    填充sql中的参数
+    :param sql: 原始sql
+    :param params: 参数列表
+    :param key_pre: 参数dict 参数名前缀标识
+    :param kw: 参数dict
+    :return:
+    """
+    need_params_num = sql.count('%s')
+    if need_params_num:
+        if params and len(params) >= need_params_num:
+            sql = sql % params[:need_params_num]
+        else:
+            print(f'not enough param for sql[{sql}]，{need_params_num} params needed, {len(params)} has given')
+            return ''
+    if kw:
+        ptn = re.compile(f'\{key_pre}([a-zA-Z0-9_]+)')  # 此处报错原因为预编译，正常解决办法有1：使用r'\'; 2: '\\\'。这两个解决办法在这里都不适用，此处报错可以忽略。
+        param_names = set(re.findall(ptn, sql))
+        for name in param_names:
+            if kw.get(name):
+                sql = sql.replace(f'{key_pre}{name}', str(kw.get(name)))
+            else:
+                print(f'param:{key_pre + name}{name} in sql[{sql}] has not given')
+                return ''
+    return sql
+
+
+def execute(def_result=None, update=0):
+    def wrapper(func):
+
+        @wraps(func)
+        def inner(self, *args, **kw):
+            cursor, result = self.cursor(), def_result
+            try:
+                kw['cursor'] = cursor
+                return func(self, *args, **kw)
+            except Exception as e:
+                print(e)
+                if update:
+                    self.conn.rollback()
+                return result
+            finally:
+                if cursor:
+                    cursor.close()
+
+        return inner
+
+    return wrapper
+
+
+class BaseDb:
+    """
+    结构型数据库基本操作：orcl/mysql/sqlite
+    """
+    conn = None
+    is_using = False
+
+    def __init__(self, url=None, **kw):
+        self.check_conn(url, **kw)
+
+    def check_conn(self, url=None, **kw):
+        """
+        设置数据库链接
+        :param url: str. cx_oracle参数，其他数据库不建议用。eg:
+            orcl: f'{username}/{passwd}@{host}:{port}/{sid}'. eg: 'test/123456@127.0.0.1:1521/orcl'
+            mysql: eg: test:123456@127.0.0.1:3306/mysql?charset=utf8&autocommit=true
+            hive: eg: test:123456@127.0.0.1:10000/hive
+            impala: eg: test:123456@127.0.0.1:10000/hive
+        :param kw: dict. eg: {'host': '127.0.0.1', 'user': 'test', 'passwd': '123456', 'db': 'mysql'}
+        :return: no return
+        """
+        try:
+            if not self.conn:
+                self.conn = self.new_conn(url, **kw)
+        except Exception as e:
+            print(e)
+
+    def new_conn(self, url=None, **kwargs):
+        """
+        生成数据库连接
+        :param url: str, 数据库 url
+        :param kwargs: dict, 创建数据库链接参数
+        :return:
+        """
+        return None
+
+    def cursor(self):
+        self.check_conn()
+        return self.conn.cursor()
+
+    def exec_select(self, sql, params: tuple = None, key_pre='#', **kw):
+        cursor = self.cursor()
+        try:
+            sql = gen_sql_with_params(sql, params=params, key_pre=key_pre, **kw)
+            if not sql:
+                return []
+            cursor.execute(sql)
+            return cursor.fetchall()
+        except Exception as e:
+            print(e)
+            return []
+        finally:
+            if cursor:
+                cursor.close()
+
+    @execute(def_result=[])
+    def select(self, sql, cursor=None, params: tuple = None, key_pre='#', **kw):
+        """
+        查询数据
+        :param sql: select sql
+        :param cursor:
+        :param params: params of select sql
+        :param key_pre: 命名参数标识符
+        :param kw: 命名参数
+        :return:
+        """
+        sql = gen_sql_with_params(sql, params=params, key_pre=key_pre, **kw)
+        if sql:
+            cursor.execute(sql)
+            return cursor.fetchall()
+        else:
+            return []
+
+    def exec_update(self, sql, param):
+        """
+        执行数据库更新操作
+        :param sql: update/insert sql
+        :param param: sql参数
+        :return: 更新成功返回1，更新失败返回0
+        """
+        cursor = self.cursor()
+        try:
+            cursor.execute(sql, param)
+            self.conn.commit()
+            return 1
+        except Exception as e:
+            print(e)
+            self.conn.rollback()
+            return 0
+        finally:
+            if cursor:
+                cursor.close()
+
+    @execute(def_result=0, update=1)
+    def update(self, sql, params, cursor=None):
+        """
+        insert/update/delete data
+        :param sql: insert/update/delete sql
+        :param params: params of update sql
+        :param cursor:
+        :return:
+        """
+        cursor.execute(sql, params)
+        self.conn.commit()
+        return 1
+
+    def exec_update_many(self, sql, params, batch_num=10000):
+        """
+        批量更新操作(一般为批量插入)
+        :param sql: insert sql
+        :param params: insert sql params
+        :param batch_num: 提交一个批次的更新数量
+        :return:
+        """
+        cursor = self.cursor()
+        try:
+            while params:
+                cursor.executemany(sql, params[0:batch_num])
+                params = params[batch_num:]
+            self.conn.commit()
+            return 1
+        except Exception as e:
+            print(e)
+            self.conn.rollback()
+            return 0
+        finally:
+            if cursor:
+                cursor.close()
+
+    def update_batch(self, sql, params, batch_num=10000, cursor=None):
+        """
+        batch insert/update/delete data
+        :param sql: insert/update/delete sql
+        :param params: batch params(list)
+        :param batch_num: batch num, the num of per commit, default 10000
+        :param cursor:
+        :return:
+        """
+        while params:
+            cursor.executemany(sql, params[0:batch_num])
+            params = params[batch_num:]
+        self.conn.commit()
+        return 1
+
+    @execute
+    def create_table(self, sql, params: tuple = None, cursor=None):
+        sql = gen_sql_with_params(sql, params=params)
+        if sql:
+            cursor.execute(sql)
+
+    @execute(def_result=[])
+    def tables(self, cursor=None):
+        cursor.execute(self.gen_query_tables_sql())
+        return cursor.fetchall()
+
+    @execute(def_result=[])
+    def columns(self, table_name, cursor=None):
+        return self.get_table_columns(table_name, cursor=cursor)
+
+    def gen_query_tables_sql(self):
+        return ''
+
+    def get_table_columns(self, table_name, cursor=None):
+        return []
+
+    def close(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+        self.is_using = False
+
+
+class BaseDbFactory:
+    # 数据库集
+    db_dict = dict()
+    # 数据库对象类型
+    db_cls = BaseDb
+
+    def get_db(self, key: str = None, **kw):
+        """
+        获取 数据库
+        :param key: 数据库标识
+        :param kw: 数据库链接创建参数
+        :return:
+        """
+        result = None
+        if key:
+            if self.db_dict:
+                dbs = self.db_dict.get(f'{key}-{kw}', [])
+                d: BaseDb
+                for d in dbs:
+                    if not d.is_using:
+                        result = d
+                        break
+            if not result:
+                kw = left_union(kw, self.get_db_conf(key))
+        if not result:
+            result = self.db_cls(**kw)
+            if result:
+                if self.db_dict.get(f'{key}-{kw}'):
+                    self.db_dict[f'{key}-{kw}'].append(result)
+                else:
+                    self.db_dict[f'{key}-{kw}'] = [result]
+        result.check_conn(kw.pop('url', None), **kw)
+        result.is_using = True
+        return result
+
+    def get_db_conf(self, key: str) -> dict:
+        """
+        获取数据库实例配置信息
+        :param key: 数据库实例标识
+        :return:
+        """
+        return dict()
